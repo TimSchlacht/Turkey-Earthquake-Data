@@ -1,6 +1,6 @@
 🇹🇷 Turkey Earthquake Analysis & Prediction System
 
-
+DashBoard Link: https://app.powerbi.com/view?r=eyJrIjoiZDIxOTNkYjktNGU5OC00MGZkLTkxNmQtMmUyMzc3OGQ0ZGIyIiwidCI6IjQ1NDIwZThkLTg1NTItNGEwMy05YjkyLWE5MzFlZjgzOWQzZiIsImMiOjh9
 
 An end-to-end project that collects, stores, analyzes, and visualizes earthquake data across Turkey, using:
 
