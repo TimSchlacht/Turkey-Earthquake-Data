@@ -37,3 +37,11 @@ Adana	        6193
 Elazig	        4160
 Hatay	        4039
 Aydin	        3876
+
+
+
+select a.latitude,b.longitude,a.depth,a.magnitude,a.province,a.district,b.population, b.area,b.altitude,b.isMetropolitan,b.isCoastal
+from EarthQuake_Data a 
+join table_Provinces b on a.province=b.province_name
+where a.country='Türkiye'
+# this query gives us the table we need for analysis.
