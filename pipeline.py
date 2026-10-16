@@ -18,6 +18,68 @@ import pandas as pd
 LOG = logging.getLogger(__name__)
 AFAD_URL = 'https://deprem.afad.gov.tr/apiv2/event/filter'
 PROVINCE_URL = 'https://turkiyeapi.dev/api/v1/provinces'
+USGS_URL = 'https://earthquake.usgs.gov/fdsnws/event/1/'
+
+
+def usgs_records(payload):
+    """Adapt GeoJSON; coordinates are longitude, latitude, depth in km."""
+    if not isinstance(payload, dict) or payload.get('type') != 'FeatureCollection' or not isinstance(payload.get('features'), list):
+        raise ValueError('Expected USGS GeoJSON FeatureCollection.')
+    records = []
+    for feature in payload['features']:
+        p, geometry = feature.get('properties') or {}, feature.get('geometry') or {}
+        coordinates = geometry.get('coordinates')
+        if geometry.get('type') != 'Point' or not isinstance(coordinates, list) or len(coordinates) != 3:
+            raise ValueError('USGS event has invalid Point geometry.')
+        def epoch(value):
+            return None if value is None else pd.to_datetime(value, unit='ms', utc=True).isoformat()
+        records.append({'eventID': feature.get('id'), 'date': epoch(p.get('time')),
+            'longitude': coordinates[0], 'latitude': coordinates[1], 'depth': coordinates[2],
+            'magnitude': p.get('mag'), 'type': p.get('magType'), 'location': p.get('place'),
+            'province': None, 'country': None, 'lastUpdateDate': epoch(p.get('updated')),
+            'event_source': 'USGS', 'source_event_url': p.get('url')})
+    return records
+
+
+def fetch_usgs_events(start, end, raw_dir, min_magnitude=4.0, limit=1000, fetcher=None):
+    """UTC query with count reconciliation, subdivision and Turkey-region bbox.
+
+    Bounding box includes neighboring countries and sea areas. Counts establish
+    retrieval coverage for the query, not completeness of the seismic catalogue.
+    """
+    fetcher = fetcher or fetch_json
+    if start.tzinfo or end.tzinfo or start >= end or not 2 <= limit <= 20000:
+        raise ValueError('Use naive UTC start < end and limit 2..20000.')
+    if start.microsecond or end.microsecond:
+        raise ValueError('Use whole-second boundaries.')
+    def window(lo, hi):
+        params = {'format': 'geojson', 'starttime': lo.isoformat(), 'endtime': hi.isoformat(),
+            'minlatitude': 35, 'maxlatitude': 43, 'minlongitude': 25, 'maxlongitude': 45,
+            'minmagnitude': min_magnitude, 'eventtype': 'earthquake'}
+        count_payload = fetcher(USGS_URL + 'count', params, raw_dir)
+        if not isinstance(count_payload, dict) or not isinstance(count_payload.get('count'), int) or count_payload['count'] < 0:
+            raise ValueError('Invalid USGS count response.')
+        count = count_payload['count']
+        if count > limit:
+            seconds = int((hi-lo).total_seconds())
+            if seconds <= 1:
+                raise RuntimeError('USGS window exceeds cap; cannot establish coverage.')
+            mid = lo + timedelta(seconds=seconds // 2)
+            return window(lo, mid) + window(mid, hi)
+        if count == 0:
+            return []
+        payload = fetcher(USGS_URL + 'query', {**params, 'limit': limit, 'orderby': 'time-asc'}, raw_dir)
+        rows = usgs_records(payload)
+        if len(rows) != count or len({r['eventID'] for r in rows}) != count:
+            raise RuntimeError('USGS count/query mismatch or duplicate IDs; rerun to reconcile.')
+        return rows
+    rows = []
+    cursor = start
+    while cursor < end:
+        stop = min(cursor+timedelta(days=1), end)
+        rows.extend(window(cursor, stop))
+        cursor = stop
+    return rows
 
 
 def fetch_json(url, params, raw_dir, attempts=3):
@@ -123,7 +185,7 @@ def parse_time(value, source_timezone):
         return pd.NaT
 
 
-def normalize_events(records, provinces, source_timezone, start=None, end=None):
+def normalize_events(records, provinces, source_timezone, start=None, end=None, allow_negative_depth=False):
     """Quarantine invalid rows; use latest source update for duplicate IDs.
 
     Negative magnitude is valid. Missing magnitude/depth is retained and counted,
@@ -131,7 +193,7 @@ def normalize_events(records, provinces, source_timezone, start=None, end=None):
     nearest province. A source province label is not a polygon spatial assignment.
     """
     columns = ['eventID', 'date', 'latitude', 'longitude', 'magnitude', 'depth',
-               'type', 'province', 'country', 'location', 'lastUpdateDate']
+               'type', 'province', 'country', 'location', 'lastUpdateDate', 'event_source', 'source_event_url']
     frame = pd.DataFrame(records)
     required = {'eventID', 'date', 'latitude', 'longitude'}
     if len(frame) and not required.issubset(frame.columns):
@@ -153,7 +215,8 @@ def normalize_events(records, provinces, source_timezone, start=None, end=None):
         frame[column] = converted
     flag(~frame.latitude.between(-90, 90), 'latitude_out_of_range')
     flag(~frame.longitude.between(-180, 180), 'longitude_out_of_range')
-    flag(frame.depth.notna() & frame.depth.lt(0), 'negative_depth')
+    if not allow_negative_depth:
+        flag(frame.depth.notna() & frame.depth.lt(0), 'negative_depth')
     rejected = frame.loc[reasons.ne('')].copy()
     rejected['rejection_reason'] = reasons[reasons.ne('')]
     valid = frame.loc[reasons.eq('')].copy()
@@ -174,7 +237,8 @@ def normalize_events(records, provinces, source_timezone, start=None, end=None):
     valid['date_key'] = valid.event_time_utc.dt.strftime('%Y%m%d').astype('int64')
     valid = valid.rename(columns={'depth': 'depth_km', 'type': 'magnitude_type', 'province': 'source_province'})
     fields = ['event_id', 'event_time_utc', 'date_key', 'province_id', 'latitude', 'longitude',
-              'magnitude', 'magnitude_type', 'depth_km', 'country', 'source_province', 'location']
+              'magnitude', 'magnitude_type', 'depth_km', 'country', 'source_province', 'location',
+              'event_source', 'source_event_url']
     valid = valid[fields].sort_values(['event_time_utc', 'event_id']).reset_index(drop=True)
     quality = {'raw_rows': len(frame), 'rejected_rows': len(rejected), 'out_of_scope_rows': out_of_scope,
                'duplicate_rows_removed': len(duplicate_rows), 'accepted_events': len(valid),
